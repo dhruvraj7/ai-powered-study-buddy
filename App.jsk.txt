@@ -1,0 +1,443 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+    getAuth, 
+    signInAnonymously, 
+    signInWithCustomToken, 
+    onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+    getFirestore, 
+    doc, 
+    setDoc, 
+    collection, 
+    query, 
+    onSnapshot, 
+    serverTimestamp 
+} from 'firebase/firestore';
+
+// --- Global Variables (Provided by Canvas Environment) ---
+// We assume __app_id, __firebase_config, and __initial_auth_token are available globally
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// --- Utility Functions ---
+
+// 1. Exponential Backoff for API Calls
+const withExponentialBackoff = async (apiCall) => {
+    let delay = 1000;
+    const maxRetries = 5;
+
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            return await apiCall();
+        } catch (error) {
+            if (i === maxRetries - 1) {
+                console.error("API call failed after all retries:", error);
+                throw error;
+            }
+            console.warn(`API call failed. Retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            delay *= 2;
+        }
+    }
+};
+
+// --- Main Application Component ---
+
+const App = () => {
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [notesText, setNotesText] = useState('');
+    const [generatedQuiz, setGeneratedQuiz] = useState(null);
+    const [savedNotes, setSavedNotes] = useState([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState(null);
+    const [activeTab, setActiveTab] = useState('notes'); // 'notes', 'quiz'
+
+    // 1. Firebase Initialization and Authentication
+    useEffect(() => {
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestore = getFirestore(app);
+            const userAuth = getAuth(app);
+            
+            setDb(firestore);
+            setAuth(userAuth);
+            
+            // Set up authentication listener
+            const unsubscribe = onAuthStateChanged(userAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    // Sign in with custom token or anonymously if token is missing
+                    try {
+                        if (initialAuthToken) {
+                            const userCredential = await signInWithCustomToken(userAuth, initialAuthToken);
+                            setUserId(userCredential.user.uid);
+                        } else {
+                            const userCredential = await signInAnonymously(userAuth);
+                            setUserId(userCredential.user.uid);
+                        }
+                    } catch (e) {
+                        console.error("Firebase authentication failed:", e);
+                        setError("Authentication failed. Check console for details.");
+                    }
+                }
+                setIsAuthReady(true);
+            });
+
+            return () => unsubscribe();
+        } catch (e) {
+            console.error("Firebase initialization failed:", e);
+            setError("Firebase failed to initialize. Check console for details.");
+        }
+    }, []);
+
+    // 2. Firestore Listener for User's Saved Notes (Data Fetching)
+    useEffect(() => {
+        if (db && userId) {
+            const notesPath = `artifacts/${appId}/users/${userId}/study_notes`;
+            const q = query(collection(db, notesPath));
+
+            const unsubscribe = onSnapshot(q, (snapshot) => {
+                const notesList = [];
+                snapshot.forEach((doc) => {
+                    notesList.push({ id: doc.id, ...doc.data() });
+                });
+                // Sort by timestamp newest first
+                notesList.sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0)); 
+                setSavedNotes(notesList);
+            }, (error) => {
+                console.error("Error listening to study_notes:", error);
+                setError("Failed to load study notes.");
+            });
+
+            return () => unsubscribe();
+        }
+    }, [db, userId]);
+
+    // 3. Handlers for Saving Notes
+    const handleSaveNote = async () => {
+        if (!db || !userId || !notesText.trim()) return;
+
+        setIsLoading(true);
+        setError(null);
+
+        const notesPath = `artifacts/${appId}/users/${userId}/study_notes`;
+        
+        try {
+            // Create a new document reference with an auto-generated ID
+            const newNoteRef = doc(collection(db, notesPath)); 
+            
+            await setDoc(newNoteRef, {
+                content: notesText.trim(),
+                timestamp: serverTimestamp(),
+                title: notesText.trim().substring(0, 50) + (notesText.length > 50 ? '...' : ''),
+            });
+
+            setNotesText('');
+            setIsLoading(false);
+        } catch (e) {
+            console.error("Error adding document: ", e);
+            setError("Could not save note.");
+            setIsLoading(false);
+        }
+    };
+
+    // 4. Core Function: Generating Quiz using Gemini API
+    const generateQuiz = useCallback(async () => {
+        if (!notesText.trim()) {
+            setError("Please enter or select notes before generating a quiz.");
+            return;
+        }
+
+        setIsLoading(true);
+        setGeneratedQuiz(null);
+        setError(null);
+
+        const userQuery = `Generate a structured quiz and a set of flashcards based on the following study notes. The quiz should have 3 multiple-choice questions. The flashcards should include 3 key terms and their definitions. \n\nNOTES: ${notesText}`;
+        const apiKey = "";
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+        // Define the desired structured JSON schema for the output
+        const responseSchema = {
+            type: "OBJECT",
+            properties: {
+                quiz: {
+                    type: "ARRAY",
+                    description: "A list of multiple-choice questions.",
+                    items: {
+                        type: "OBJECT",
+                        properties: {
+                            question: { type: "STRING" },
+                            options: { type: "ARRAY", items: { type: "STRING" } },
+                            correctAnswer: { type: "STRING", description: "The correct option text." }
+                        }
+                    }
+                },
+                flashcards: {
+                    type: "ARRAY",
+                    description: "A list of key terms and their definitions.",
+                    items: {
+                        type: "OBJECT",
+                        properties: {
+                            term: { type: "STRING" },
+                            definition: { type: "STRING" }
+                        }
+                    }
+                }
+            }
+        };
+
+        const payload = {
+            contents: [{ parts: [{ text: userQuery }] }],
+            generationConfig: {
+                responseMimeType: "application/json",
+                responseSchema: responseSchema,
+            },
+        };
+
+        try {
+            const result = await withExponentialBackoff(async () => {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response.json();
+            });
+
+            const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (jsonText) {
+                const parsedQuiz = JSON.parse(jsonText);
+                setGeneratedQuiz(parsedQuiz);
+                setActiveTab('quiz'); // Switch to quiz view
+            } else {
+                throw new Error("Received an empty response from the AI.");
+            }
+        } catch (e) {
+            console.error("AI Generation Error:", e);
+            setError("Failed to generate quiz. Please try again.");
+        } finally {
+            setIsLoading(false);
+        }
+    }, [notesText]);
+
+    // Helper component for loading indicator
+    const LoadingSpinner = () => (
+        <div className="flex items-center justify-center space-x-2 p-4">
+            <svg className="animate-spin h-5 w-5 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <span className="text-indigo-600 font-medium">Generating AI Content...</span>
+        </div>
+    );
+
+    // Helper component for displaying a generated quiz
+    const QuizDisplay = ({ quizData }) => {
+        const [showAnswers, setShowAnswers] = useState({});
+
+        if (!quizData || (!quizData.quiz?.length && !quizData.flashcards?.length)) {
+            return <div className="p-4 text-center text-gray-500">No quiz data available.</div>;
+        }
+
+        const handleToggleAnswer = (id) => {
+            setShowAnswers(prev => ({ ...prev, [id]: !prev[id] }));
+        };
+
+        return (
+            <div className="space-y-8">
+                {quizData.quiz?.length > 0 && (
+                    <div>
+                        <h3 className="text-xl font-bold text-indigo-700 mb-4 border-b pb-2">Multiple Choice Quiz</h3>
+                        <div className="space-y-6">
+                            {quizData.quiz.map((q, index) => (
+                                <div key={index} className="bg-white p-5 rounded-lg shadow-md transition duration-300 hover:shadow-lg border border-indigo-100">
+                                    <p className="font-semibold text-gray-800 mb-3">Q{index + 1}: {q.question}</p>
+                                    <div className="space-y-2 text-sm">
+                                        {q.options.map((option, optIndex) => (
+                                            <div key={optIndex} className={`p-2 rounded-md transition duration-150 ${q.correctAnswer === option ? 'bg-green-50/70 text-green-700' : 'bg-gray-50 text-gray-700'}`}>
+                                                {option}
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className="mt-4 pt-3 border-t border-gray-100 text-sm">
+                                        <span className="font-medium text-green-600">Correct Answer:</span> {q.correctAnswer}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+
+                {quizData.flashcards?.length > 0 && (
+                    <div>
+                        <h3 className="text-xl font-bold text-indigo-700 mb-4 mt-8 border-b pb-2">Flashcards</h3>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                            {quizData.flashcards.map((card, index) => (
+                                <div key={index} className="relative h-40">
+                                    <div 
+                                        className={`absolute inset-0 w-full h-full p-6 rounded-xl shadow-lg cursor-pointer transform transition-transform duration-700 ease-in-out backface-hidden ${showAnswers[index] ? 'rotate-y-180' : ''}`}
+                                        style={{ transformStyle: 'preserve-3d' }}
+                                        onClick={() => handleToggleAnswer(index)}
+                                    >
+                                        {/* Front of the Card (Term) */}
+                                        <div className="absolute inset-0 bg-indigo-500 text-white flex items-center justify-center rounded-xl p-4 transition-opacity duration-300" style={{ backfaceVisibility: 'hidden' }}>
+                                            <p className="text-lg font-bold text-center">Term: {card.term}</p>
+                                            <span className="absolute bottom-2 text-xs opacity-75">Tap to reveal definition</span>
+                                        </div>
+
+                                        {/* Back of the Card (Definition) */}
+                                        <div className="absolute inset-0 bg-white text-gray-800 border-2 border-indigo-500 flex flex-col items-center justify-center rounded-xl p-4 transition-opacity duration-300 rotate-y-180" style={{ backfaceVisibility: 'hidden', transform: 'rotateY(180deg)' }}>
+                                            <p className="font-semibold mb-2">Definition:</p>
+                                            <p className="text-sm text-center">{card.definition}</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+            </div>
+        );
+    };
+
+    // Main App Render
+    return (
+        <div className="min-h-screen bg-gray-50 font-sans p-4 sm:p-8">
+            <style>{`
+                /* Custom styles for 3D card flip effect */
+                @keyframes rotateY {
+                    0% { transform: rotateY(0deg); }
+                    100% { transform: rotateY(180deg); }
+                }
+                .backface-hidden {
+                    backface-visibility: hidden;
+                }
+                .rotate-y-180 {
+                    transform: rotateY(180deg) !important;
+                }
+            `}</style>
+            <header className="text-center mb-10">
+                <h1 className="text-4xl font-extrabold text-indigo-800">AI Study Buddy</h1>
+                <p className="text-md text-gray-500 mt-1">Personalized Learning Assistant powered by Gemini</p>
+                <div className="mt-4 text-xs text-gray-600 p-2 bg-indigo-50 rounded-lg inline-block">
+                    {isAuthReady 
+                        ? (userId ? `User ID: ${userId}` : "Signing in...")
+                        : "Initializing application..."
+                    }
+                </div>
+            </header>
+
+            {error && (
+                <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl relative mb-6" role="alert">
+                    <strong className="font-bold">Error:</strong>
+                    <span className="block sm:inline ml-2">{error}</span>
+                </div>
+            )}
+
+            <main className="max-w-4xl mx-auto bg-white p-6 sm:p-8 rounded-2xl shadow-2xl">
+                {/* Tab Navigation */}
+                <div className="flex border-b border-gray-200 mb-6">
+                    <button
+                        onClick={() => setActiveTab('notes')}
+                        className={`py-2 px-4 text-sm font-medium transition duration-150 ${
+                            activeTab === 'notes' ? 'text-indigo-700 border-b-2 border-indigo-700' : 'text-gray-500 hover:text-indigo-600'
+                        }`}
+                    >
+                        Notes & Input
+                    </button>
+                    <button
+                        onClick={() => setActiveTab('quiz')}
+                        className={`py-2 px-4 text-sm font-medium transition duration-150 ${
+                            activeTab === 'quiz' ? 'text-indigo-700 border-b-2 border-indigo-700' : 'text-gray-500 hover:text-indigo-600'
+                        }`}
+                        disabled={!generatedQuiz && !isLoading}
+                    >
+                        Generated Quiz/Flashcards
+                    </button>
+                </div>
+
+                {/* Notes Input Tab */}
+                {activeTab === 'notes' && (
+                    <div className="space-y-6">
+                        <textarea
+                            className="w-full p-4 h-40 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 resize-none text-sm"
+                            placeholder="Paste your study notes, lecture transcript, or textbook summary here..."
+                            value={notesText}
+                            onChange={(e) => setNotesText(e.target.value)}
+                            disabled={isLoading}
+                        />
+                        <div className="flex flex-col sm:flex-row space-y-3 sm:space-y-0 sm:space-x-4">
+                            <button
+                                onClick={handleSaveNote}
+                                disabled={isLoading || !notesText.trim() || !isAuthReady}
+                                className="flex-1 bg-indigo-500 text-white py-3 px-4 rounded-lg font-semibold hover:bg-indigo-600 transition duration-200 disabled:bg-indigo-300 shadow-md hover:shadow-lg"
+                            >
+                                {isLoading ? 'Saving...' : 'Save Notes to Firestore'}
+                            </button>
+                            <button
+                                onClick={generateQuiz}
+                                disabled={isLoading || !notesText.trim()}
+                                className="flex-1 bg-green-500 text-white py-3 px-4 rounded-lg font-semibold hover:bg-green-600 transition duration-200 disabled:bg-green-300 shadow-md hover:shadow-lg"
+                            >
+                                {isLoading ? <LoadingSpinner /> : 'Generate Quiz & Flashcards (AI)'}
+                            </button>
+                        </div>
+                        
+                        <div className="pt-6 border-t mt-6 border-gray-100">
+                            <h2 className="text-xl font-bold text-gray-700 mb-4">Your Saved Notes ({savedNotes.length})</h2>
+                            <div className="space-y-3">
+                                {savedNotes.length === 0 ? (
+                                    <p className="text-gray-400 italic">No notes saved yet. Save a note above!</p>
+                                ) : (
+                                    savedNotes.map(note => (
+                                        <div 
+                                            key={note.id} 
+                                            className="p-3 border border-gray-200 rounded-lg cursor-pointer bg-gray-50 hover:bg-indigo-100 transition duration-150 flex justify-between items-center"
+                                            onClick={() => setNotesText(note.content)}
+                                        >
+                                            <span className="text-sm font-medium text-gray-800 truncate flex-1">
+                                                {note.title}
+                                            </span>
+                                            <span className="text-xs text-gray-500 ml-4">
+                                                {note.timestamp ? new Date(note.timestamp.seconds * 1000).toLocaleDateString() : 'N/A'}
+                                            </span>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Quiz Output Tab */}
+                {activeTab === 'quiz' && (
+                    <div className="space-y-6">
+                         {isLoading ? (
+                            <LoadingSpinner />
+                        ) : (
+                            <QuizDisplay quizData={generatedQuiz} />
+                        )}
+                        <button
+                            onClick={() => setActiveTab('notes')}
+                            className="w-full mt-4 bg-gray-200 text-gray-700 py-2 rounded-lg font-semibold hover:bg-gray-300 transition duration-200"
+                        >
+                            Back to Notes
+                        </button>
+                    </div>
+                )}
+            </main>
+        </div>
+    );
+}
+
+export default App;
