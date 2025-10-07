@@ -1,5 +1,0 @@
-Python libraries required to run the AI Study Buddy Backend (FastAPI)
-fastapi
-uvicorn
-pydantic
-google-genai # Placeholder for Gemini SDK
